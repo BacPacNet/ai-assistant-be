@@ -1,4 +1,4 @@
-#ps.py
+# ps.py
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
 from fastapi.responses import StreamingResponse, JSONResponse
 import asyncio
@@ -62,6 +62,15 @@ model = genai.GenerativeModel(
     safety_settings=safety_settings,
 )
 
+SYSTEM_PROMPT = (
+    """
+    You are my academic counsellor with a focus on my college studies.
+    Your goal is to provide helpful and encouraging advice on topics like
+    time management, study strategies, course selection, and dealing with
+    academic stress. Keep your tone supportive and knowledgeable.
+    """.strip()
+)
+
 class MessagePayload(BaseModel):
     userId: str
     prompt: str
@@ -69,21 +78,40 @@ class MessagePayload(BaseModel):
     communityId: Optional[str] = ""
     collegeID: Optional[str] = ""
 
+
+def build_memory_prompt(thread_id: str, current_prompt: str) -> str:
+    """Load past messages for the thread and build a single prompt that includes memory."""
+    memory_blocks = []
+    try:
+        past_msgs = list(collection.find({"threadId": thread_id}).sort("createdAt", 1))
+        print(f"[DB] Found {len(past_msgs)} past messages for thread {thread_id}")
+    except Exception as e:
+        print(f"[DB ERROR] Failed to read past messages: {e}")
+        past_msgs = []
+
+    for msg in past_msgs:
+        if msg.get("prompt"):
+            memory_blocks.append(f"User: {msg.get('prompt','')}")
+        if msg.get("response"):
+            memory_blocks.append(f"Bot: {msg.get('response','')}")
+
+    memory_blocks.append(f"User: {current_prompt}")
+
+    full_prompt = "\n".join([SYSTEM_PROMPT, *memory_blocks])
+    return full_prompt
+
+
 def generate_full_reply(prompt_text: str) -> str:
-    """
-    Calls Gemini synchronously (blocking) to get full response text.
-    We run this in a thread (asyncio.to_thread) from async code so it doesn't block the event loop.
-    """
+    """Calls Gemini synchronously (blocking) to get full response text."""
     try:
         convo = model.start_chat(history=[])
-        resp = convo.send_message(prompt_text)  
+        resp = convo.send_message(prompt_text)
         text = resp.text or ""
         return text
     except Exception as e:
         print(f"[GEN ERROR] Generation failed: {e}")
         return "Sorry, I couldn't generate a response right now."
 
-# ---- WebSocket Endpoint ----
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
@@ -92,7 +120,7 @@ async def websocket_endpoint(websocket: WebSocket):
     try:
         while True:
             raw_data = await websocket.receive_text()
-            print(f"[WS] Received raw payload: {raw_data[:200]}")  
+            print(f"[WS] Received raw payload: {raw_data[:200]}")
             try:
                 data = json.loads(raw_data)
             except Exception as e:
@@ -107,36 +135,13 @@ async def websocket_endpoint(websocket: WebSocket):
                 await websocket.send_text("Invalid payload fields. Required: userId, prompt")
                 continue
 
-            # threadId validation
             if not payload.threadId:
                 payload.threadId = f"thread_{uuid.uuid4().hex[:10]}"
                 print(f"[THREAD] New thread created: {payload.threadId}")
+                await websocket.send_text(json.dumps({"threadId": payload.threadId}))
 
-            # memory blocks + system prompt 
-            memory_blocks = []
-            try:
-                past_msgs = list(collection.find({"threadId": payload.threadId}).sort("createdAt", 1))
-                print(f"[DB] Found {len(past_msgs)} past messages for thread {payload.threadId}")
-            except Exception as e:
-                print(f"[DB ERROR] Failed to read past messages: {e}")
-                past_msgs = []
-
-            for msg in past_msgs:
-                if msg.get("prompt"):
-                    memory_blocks.append(f"User: {msg.get('prompt','')}")
-                if msg.get("response"):
-                    memory_blocks.append(f"Bot: {msg.get('response','')}")
-
-            memory_blocks.append(f"User: {payload.prompt}")
-
-            system_prompt = """
-            You are my academic counsellor with a focus on my college studies.
-            Your goal is to provide helpful and encouraging advice on topics like
-            time management, study strategies, course selection, and dealing with
-            academic stress. Keep your tone supportive and knowledgeable.
-            """
-            full_prompt = "\n".join([system_prompt.strip(), *memory_blocks])
-            print("[GEN] Sending prompt to Gemini (full prompt length:", len(full_prompt), "chars )")
+            full_prompt = build_memory_prompt(payload.threadId, payload.prompt)
+            print("[GEN] Sending prompt to Gemini (length:", len(full_prompt), ")")
 
             full_reply = await asyncio.to_thread(generate_full_reply, full_prompt)
             print("[GEN] Received full reply length:", len(full_reply))
@@ -151,12 +156,10 @@ async def websocket_endpoint(websocket: WebSocket):
                     await websocket.send_text(chunk)
                     accumulated.append(chunk)
                     i += chunk_size
-                    # edit needed
                     await asyncio.sleep(random.uniform(0.05, 0.18))
                 print("[WS] Finished streaming all chunks to client")
             except WebSocketDisconnect:
                 print("[WS] Client disconnected during stream")
-                # save what was streamed so far
             except Exception as e:
                 print(f"[WS SEND ERROR] {e}")
 
@@ -170,7 +173,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 "response": final_text,
                 "createdAt": datetime.utcnow(),
                 "updatedAt": datetime.utcnow(),
-                "__v": 0
+                "__v": 0,
             }
             try:
                 res = collection.insert_one(doc)
@@ -189,9 +192,11 @@ async def websocket_endpoint(websocket: WebSocket):
         except Exception:
             pass
 
+
 @app.get("/")
 async def root():
     return {"message": "Chatbot is running!!"}
+
 
 @app.post("/stream")
 async def stream_response(request: Request):
@@ -199,13 +204,21 @@ async def stream_response(request: Request):
         body = await request.json()
         prompt = body.get("prompt")
         user_id = body.get("userId")
+        thread_id = body.get("threadId") or f"thread_{uuid.uuid4().hex[:10]}"
+        community_id = body.get("communityId", "")
+        college_id = body.get("collegeID", "")
 
         if not prompt or not user_id:
             return JSONResponse({"error": "Missing prompt or userId in request."}, status_code=400)
 
-        full_reply = await asyncio.to_thread(generate_full_reply, prompt)
+        full_prompt = build_memory_prompt(thread_id, prompt)
+
+        full_reply = await asyncio.to_thread(generate_full_reply, full_prompt)
 
         async def event_generator():
+            yield f"data: {{\"threadId\": \"{thread_id}\"}}\n\n"
+            await asyncio.sleep(0.1)
+
             words = full_reply.split()
             chunk_size = 6
             for i in range(0, len(words), chunk_size):
@@ -215,12 +228,14 @@ async def stream_response(request: Request):
 
         doc = {
             "userId": user_id,
+            "communityId": community_id,
+            "collegeID": college_id,
             "prompt": prompt,
             "response": full_reply,
-            "threadId": f"thread_{uuid.uuid4().hex[:10]}",
+            "threadId": thread_id,
             "createdAt": datetime.utcnow(),
             "updatedAt": datetime.utcnow(),
-            "__v": 0
+            "__v": 0,
         }
         try:
             res = collection.insert_one(doc)
